@@ -1,0 +1,7 @@
+streamlit==1.39.0
+spotipy==2.24.0
+SQLAlchemy==2.0.34
+pandas==2.2.2
+python-dotenv==1.0.1
+requests==2.32.3
+tqdm==4.67.1

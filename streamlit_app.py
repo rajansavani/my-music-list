@@ -1,5 +1,6 @@
 # streamlit_app.py
-# minimal app with artist completion meters, album/track ratings, and safe db sessions
+# artist grid (sortable), collapsible artist detail with tabs, singles as track cards,
+# bonus releases as album cards, robust duplicate propagation, and subtle css polish
 
 import os
 from pathlib import Path
@@ -18,13 +19,12 @@ from src.models import (
 from src.ingest import ingest_artist
 
 # ---------- setup ----------
-st.set_page_config(page_title="my music list", page_icon="🎶")
+st.set_page_config(page_title="my music list", page_icon="🎶", layout="wide")
 load_dotenv(dotenv_path=Path(__file__).parent / ".env")
 init_db()
 
 CLIENT_ID = os.getenv("SPOTIPY_CLIENT_ID")
 CLIENT_SECRET = os.getenv("SPOTIPY_CLIENT_SECRET")
-# important: keep redirect on a different port than streamlit (8501) to avoid conflicts
 REDIRECT_URI = os.getenv("SPOTIPY_REDIRECT_URI", "http://127.0.0.1:8888/callback")
 CACHE_PATH = Path(__file__).parent / ".spotipyoauthcache"
 
@@ -40,19 +40,32 @@ sp = spotipy.Spotify(auth_manager=auth_manager)
 def db():
     return SessionLocal()
 
-# ---------- helpers: ratings + metrics ----------
+# ---------- light theme polish (css) ----------
+st.markdown("""
+<style>
+/* center text in image captions */
+.block-container { padding-top: 1.2rem; }
+h1, h2, h3 { letter-spacing: 0.2px; }
+img { border-radius: 12px; }
+div[data-testid="stMetricDelta"] { justify-content: center; }
+.card {
+  border: 1px solid #e6e6e6; border-radius: 16px; padding: 10px 12px;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+}
+.rating-badge { font-weight:600; padding:4px 8px; border-radius:10px; }
+</style>
+""", unsafe_allow_html=True)
+
+# ---------- helpers: visuals + math ----------
 
 def rating_color(score: int | float | None) -> str:
-    """0 -> red, 5 -> yellow, 10 -> green. returns hex color."""
     if score is None:
         return "#666666"
     s = max(0.0, min(10.0, float(score)))
     if s <= 5.0:
-        # red to yellow
         t = s / 5.0
         r, g, b = 255, int(255 * t), 0
     else:
-        # yellow to green
         t = (s - 5.0) / 5.0
         r, g, b = int(255 * (1 - t)), 255, 0
     return f"#{r:02x}{g:02x}{b:02x}"
@@ -61,19 +74,12 @@ def rating_badge(label: str, score: float | None):
     col = rating_color(score)
     txt = "—" if score is None else f"{score:.1f}"
     st.markdown(
-        f'<span style="display:inline-block;padding:4px 8px;border-radius:10px;'
-        f'background:{col}20;border:1px solid {col};color:{col};font-weight:600">'
+        f'<span class="rating-badge" style="background:{col}20;border:1px solid {col};color:{col};">'
         f'{label}: {txt}</span>',
         unsafe_allow_html=True
     )
 
 def album_display_rating(s, album_id: str) -> float | None:
-    """
-    album rating rule:
-      - if an explicit album override exists -> use it
-      - elif any track ratings exist -> average them
-      - else -> None
-    """
     rs = s.get(UserReleaseState, album_id)
     if rs and rs.rating is not None:
         return float(rs.rating)
@@ -86,10 +92,6 @@ def album_display_rating(s, album_id: str) -> float | None:
     return float(avg) if avg is not None else None
 
 def artist_completion(s, artist_id: str, primary_only: bool = True) -> tuple[int, int, float]:
-    """
-    returns (listened_count, total_releases, percentage) at the release level.
-    filters canonical releases only (variants hidden).
-    """
     relq = (
         s.query(Release.id)
         .join(ArtistRelease, ArtistRelease.release_id == Release.id)
@@ -112,6 +114,113 @@ def artist_completion(s, artist_id: str, primary_only: bool = True) -> tuple[int
 
     pct = (listened / total) * 100.0
     return listened, total, pct
+
+def ms_to_minsec(ms: int | None) -> str:
+    if not ms:
+        return "—"
+    s = int(ms // 1000)
+    return f"{s//60}:{s%60:02d}"
+
+# duplicate propagation: mirror listened/rating to all duplicates and refresh UI
+def propagate_track_state(track_id: str, artist_id: str, listened: bool | None = None, rating: int | None = None):
+    with db() as s:
+        t = s.get(Track, track_id)
+        if not t:
+            return
+        matches = []
+        if t.canonical_key:
+            matches = s.query(Track).filter(Track.canonical_key == t.canonical_key).all()
+        elif t.isrc:
+            matches = s.query(Track).filter(Track.isrc == t.isrc).all()
+        else:
+            return
+        for m in matches:
+            ids = (m.artist_ids_csv or "").split(",") if m.artist_ids_csv else []
+            # ensure relevant to target artist (overlap)
+            if (artist_id not in ids) and ((m.primary_artist_id or "") != artist_id):
+                continue
+            row = s.get(UserTrackState, m.id) or UserTrackState(track_id=m.id)
+            if listened is not None:
+                row.listened = bool(listened)
+            if rating is not None:
+                row.rating = int(rating)
+            s.add(row)
+        s.commit()
+    st.rerun()
+
+# compact track card used for singles and features
+def track_card(track, artist_id: str):
+    names = (track.artist_names_csv or "").split(",") if track.artist_names_csv else []
+    ids = (track.artist_ids_csv or "").split(",") if track.artist_ids_csv else []
+    featured = [n for (i, n) in zip(ids, names) if i and i != artist_id]
+    feat_txt = f" • feat. {', '.join(featured)}" if featured else ""
+    duration = ms_to_minsec(track.duration_ms)
+
+    c1, c2, c3 = st.columns([6, 2, 2])
+    with c1:
+        st.write(f"**{track.title}**{feat_txt}")
+        st.caption(duration)
+
+    with db() as s:
+        ts = s.get(UserTrackState, track.id)
+        listened_val = ts.listened if ts else False
+        rating_val = ts.rating if (ts and ts.rating is not None) else 0
+
+    with c2:
+        new_listened = st.checkbox("listened", value=listened_val, key=f"tl_{track.id}")
+        if new_listened != listened_val:
+            propagate_track_state(track.id, artist_id, listened=new_listened)
+
+    with c3:
+        new = st.select_slider("rating", options=list(range(0, 11)),
+                               value=rating_val, key=f"tr_{track.id}", label_visibility="collapsed")
+        if new != rating_val:
+            propagate_track_state(track.id, artist_id, rating=int(new))
+
+# -------- artist grid helpers --------
+def artist_metrics():
+    with db() as s:
+        artists = s.query(Artist).all()
+        out = []
+        for a in artists:
+            p_listened, p_total, p_pct = artist_completion(s, a.id, primary_only=True)
+            out.append({
+                "id": a.id,
+                "name": a.name,
+                "image": a.image,
+                "pct": p_pct,
+                "count": (p_listened, p_total),
+            })
+        return out
+
+def render_artist_grid(artists, sort_by="pct", cols=5):
+    if sort_by == "name":
+        artists = sorted(artists, key=lambda x: x["name"].lower())
+    elif sort_by == "pct":
+        artists = sorted(artists, key=lambda x: (-x["pct"], x["name"].lower()))
+    rows = (len(artists) + cols - 1) // cols
+    open_set = st.session_state.setdefault("open_artist", set())
+    for r in range(rows):
+        cs = st.columns(cols, gap="small")
+        for i in range(cols):
+            idx = r*cols + i
+            if idx >= len(artists): break
+            a = artists[idx]
+            with cs[i]:
+                st.markdown('<div class="card">', unsafe_allow_html=True)
+                if a["image"]:
+                    st.image(a["image"], width=220)
+                st.markdown(
+                    f"<div style='text-align:center;font-weight:700;margin-top:6px'>{a['name']}</div>",
+                    unsafe_allow_html=True
+                )
+                st.progress(int(a["pct"]))
+                st.caption(f"{a['count'][0]}/{a['count'][1]} • {a['pct']:.0f}%")
+                if st.button("open", key=f"open_{a['id']}"):
+                    open_set.add(a["id"])
+                    st.session_state["open_artist"] = open_set
+                    st.rerun()
+                st.markdown('</div>', unsafe_allow_html=True)
 
 # ---------- ui ----------
 st.title("discography tracker 🎶")
@@ -146,8 +255,17 @@ if q:
 
 st.divider()
 
-# list artists
-st.subheader("📀 your artists")
+# artist grid (sortable)
+st.subheader("your artists")
+sort_choice = st.radio("sort by", ["% complete", "name"], horizontal=True)
+sort_key = "pct" if sort_choice == "% complete" else "name"
+grid_data = artist_metrics()
+render_artist_grid(grid_data, sort_by=sort_key, cols=5)
+
+st.divider()
+
+# detail sections (collapsible by tile "open" button)
+open_set = st.session_state.get("open_artist", set())
 with db() as s:
     artists = s.query(Artist).order_by(Artist.name.asc()).all()
 
@@ -155,164 +273,177 @@ if not artists:
     st.info("no artists yet — search above to add and sync.")
 else:
     for artist in artists:
-        st.markdown(f"## {artist.name}")
-        if artist.image:
-            st.image(artist.image, width=96)
+        expanded_flag = (artist.id in open_set)
+        with st.expander(f"open {artist.name}'s discography", expanded=expanded_flag):
+            # completion meters
+            with db() as s2:
+                p_listened, p_total, p_pct = artist_completion(s2, artist.id, primary_only=True)
+                a_listened, a_total, a_pct = artist_completion(s2, artist.id, primary_only=False)
 
-        # completion meters
-        with db() as s:
-            p_listened, p_total, p_pct = artist_completion(s, artist.id, primary_only=True)
-            a_listened, a_total, a_pct = artist_completion(s, artist.id, primary_only=False)
+            c1, c2, c3 = st.columns([2, 2, 1])
+            with c1:
+                st.write("**primary discography**")
+                st.progress(int(p_pct))
+                st.caption(f"{p_listened}/{p_total} • {p_pct:.0f}%")
+            with c2:
+                st.write("**all releases (incl. appears_on)**")
+                st.progress(int(a_pct))
+                st.caption(f"{a_listened}/{a_total} • {a_pct:.0f}%")
+            with c3:
+                if st.button("refresh", key=f"refresh_{artist.id}"):
+                    with db() as s3:
+                        ingest_artist(s3, sp, artist.id)
+                    st.success("refreshed")
 
-        c1, c2 = st.columns(2)
-        with c1:
-            st.write("**primary discography**")
-            st.progress(int(p_pct))
-            st.caption(f"{p_listened}/{p_total} • {p_pct:.0f}%")
-        with c2:
-            st.write("**all releases (incl. appears_on)**")
-            st.progress(int(a_pct))
-            st.caption(f"{a_listened}/{a_total} • {a_pct:.0f}%")
-
-        # toggle which releases to show
-        view_mode = st.radio(
-            "view",
-            ["primary only", "all releases"],
-            horizontal=True,
-            key=f"view_{artist.id}"
-        )
-        show_all = (view_mode == "all releases")
-
-        # query releases for this artist (avoid lazy loads)
-        with db() as s:
-            rels_q = (
-                s.query(Release)
-                .join(ArtistRelease, ArtistRelease.release_id == Release.id)
-                .filter(ArtistRelease.artist_id == artist.id)
-                .filter((Release.is_variant == False) | (Release.is_variant.is_(None)))
+            # view toggle
+            view_mode = st.radio(
+                "view",
+                ["primary only", "all releases"],
+                horizontal=True,
+                key=f"view_{artist.id}"
             )
-            if not show_all:
-                rels_q = rels_q.filter(ArtistRelease.role == "primary")
-            rels = rels_q.order_by(Release.release_date.desc().nullslast()).all()
+            show_all = (view_mode == "all releases")
 
-        if not rels:
-            st.write("_no releases found (try refresh after syncing)_")
+            # releases query
+            with db() as s4:
+                rels_q = (
+                    s4.query(Release)
+                    .join(ArtistRelease, ArtistRelease.release_id == Release.id)
+                    .filter(ArtistRelease.artist_id == artist.id)
+                    .filter((Release.is_variant == False) | (Release.is_variant.is_(None)))
+                )
+                if not show_all:
+                    rels_q = rels_q.filter(ArtistRelease.role == "primary")
+                rels = rels_q.order_by(Release.release_date.desc().nullslast()).all()
 
-        # render releases
-        for r in rels:
-            # count hidden variants
-            with db() as s:
-                variants = s.query(Release).filter(Release.variant_of == r.id).count()
+            if not rels:
+                st.write("_no releases found (try refresh after syncing)_")
 
-            cols = st.columns([1, 5, 2.5, 2.5])
-            with cols[0]:
-                if r.cover:
-                    st.image(r.cover, width=56)
-
-            with cols[1]:
-                year = (r.release_date or "")[:4]
-                st.write(f"**{r.title}** ({year})  \n_{r.group or r.type}_")
-                if variants:
-                    with st.expander(f"{variants} variant(s) hidden"):
-                        with db() as s:
-                            vrows = s.query(Release).filter(Release.variant_of == r.id).all()
-                        for v in vrows:
-                            vy = (v.release_date or "")[:4]
-                            st.write(f"- {v.title} ({vy})")
-
-                # album rating badge (override or computed from tracks)
-                with db() as s:
-                    disp_rating = album_display_rating(s, r.id)
-                rating_badge("album rating", disp_rating)
-
-            # listened toggle (release-level)
-            with db() as s:
-                state = s.get(UserReleaseState, r.id)
-                listened_val = state.listened if state else False
-                rating_val = state.rating if (state and state.rating is not None) else 0
-
-            with cols[2]:
-                if st.checkbox("listened", value=listened_val, key=f"listened_{r.id}"):
-                    with db() as s:
-                        row = s.get(UserReleaseState, r.id)
-                        if row is None:
-                            row = UserReleaseState(release_id=r.id, listened=True)
-                            s.add(row)
-                        else:
-                            row.listened = True
-                        s.commit()
-                else:
-                    with db() as s:
-                        row = s.get(UserReleaseState, r.id)
-                        if row:
-                            row.listened = False
-                            s.commit()
-
-            # album rating override slider
-            with cols[3]:
-                ov_new = st.slider("album rating", 0, 10, value=rating_val, key=f"rating_{r.id}")
-                if ov_new != rating_val:
-                    with db() as s:
-                        row = s.get(UserReleaseState, r.id)
-                        if row is None:
-                            row = UserReleaseState(release_id=r.id, rating=int(ov_new))
-                            s.add(row)
-                        else:
-                            row.rating = int(ov_new)
-                        s.commit()
-
-            # per-track ratings ui (compact)
-            with st.expander("tracks & rating"):
-                # list tracks ordered
-                with db() as s:
+            # render releases
+            for r in rels:
+                # tracks (used by tabs)
+                with db() as s5:
                     tracks = (
-                        s.query(Track)
+                        s5.query(Track)
                         .filter(Track.release_id == r.id)
                         .order_by(Track.disc_number.asc(), Track.track_number.asc())
                         .all()
                     )
-                    # map existing states
-                    t_states = {t.id: s.get(UserTrackState, t.id) for t in tracks}
 
-                for t in tracks:
-                    c1, c2, c3 = st.columns([6, 2, 2])
-                    with c1:
-                        st.write(f"{t.disc_number}.{t.track_number} — **{t.title}**")
+                is_single_track = (r.group == "single" and len(tracks) == 1)
 
-                    # track listened
-                    listened_key = f"tl_{t.id}"
-                    listened_val = (t_states[t.id].listened if t_states[t.id] else False)
-                    new_listened = st.checkbox("listened", value=listened_val, key=listened_key)
-                    if new_listened != listened_val:
-                        with db() as s:
-                            row = s.get(UserTrackState, t.id)
-                            if row is None:
-                                row = UserTrackState(track_id=t.id, listened=new_listened)
-                                s.add(row)
-                            else:
-                                row.listened = new_listened
-                            s.commit()
+                if is_single_track:
+                    cols = st.columns([1, 9])
+                    with cols[0]:
+                        if r.cover:
+                            st.image(r.cover, width=56)
+                    with cols[1]:
+                        track_card(tracks[0], artist.id)
+                else:
+                    # album/ep/compilation row with tabs
+                    st.markdown("---")
+                    cols = st.columns([1, 11])
+                    with cols[0]:
+                        if r.cover:
+                            st.image(r.cover, width=56)
 
-                    # track rating
-                    rating_key = f"tr_{t.id}"
-                    cur_rating = (t_states[t.id].rating if t_states[t.id] and t_states[t.id].rating is not None else 0)
-                    new_rating = st.select_slider(
-                        "rating", options=list(range(0, 11)),
-                        value=cur_rating, key=rating_key, label_visibility="collapsed"
-                    )
-                    if new_rating != cur_rating:
-                        with db() as s:
-                            row = s.get(UserTrackState, t.id)
-                            if row is None:
-                                row = UserTrackState(track_id=t.id, rating=int(new_rating))
-                                s.add(row)
-                            else:
-                                row.rating = int(new_rating)
-                            s.commit()
+                    with cols[1]:
+                        tab_overview, tab_tracks = st.tabs(["Overview", "Tracks"])
 
-                # show computed rating from tracks after edits
-                with db() as s:
-                    comp = album_display_rating(s, r.id)
-                rating_badge("computed from tracks", comp)
+                        with tab_overview:
+                            year = (r.release_date or "")[:4]
+                            st.write(f"**{r.title}** ({year})  \n_{r.group or r.type}_")
 
-        st.markdown("---")
+                            # hidden variants toggle
+                            with db() as s6:
+                                variants = s6.query(Release).filter(Release.variant_of == r.id).count()
+                            if variants:
+                                show_vars = st.checkbox(f"show {variants} variant(s)", key=f"variants_toggle_{r.id}")
+                                if show_vars:
+                                    with db() as s7:
+                                        vrows = s7.query(Release).filter(Release.variant_of == r.id).all()
+                                    for v in vrows:
+                                        vy = (v.release_date or "")[:4]
+                                        st.write(f"- {v.title} ({vy})")
+
+                            # rating badge (override or computed from tracks)
+                            with db() as s8:
+                                disp_rating = album_display_rating(s8, r.id)
+                            rating_badge("album rating", disp_rating)
+
+                            # release-level listened and album rating override
+                            with db() as s9:
+                                state = s9.get(UserReleaseState, r.id)
+                                listened_val = state.listened if state else False
+                                rating_val = state.rating if (state and state.rating is not None) else 0
+
+                            cA, cB = st.columns(2)
+                            with cA:
+                                if st.checkbox("listened", value=listened_val, key=f"listened_{r.id}"):
+                                    with db() as s10:
+                                        row = s10.get(UserReleaseState, r.id)
+                                        if row is None:
+                                            row = UserReleaseState(release_id=r.id, listened=True)
+                                            s10.add(row)
+                                        else:
+                                            row.listened = True
+                                        s10.commit()
+                                else:
+                                    with db() as s11:
+                                        row = s11.get(UserReleaseState, r.id)
+                                        if row:
+                                            row.listened = False
+                                            s11.commit()
+                            with cB:
+                                ov_new = st.slider("album rating", 0, 10, value=rating_val, key=f"rating_{r.id}")
+                                if ov_new != rating_val:
+                                    with db() as s12:
+                                        row = s12.get(UserReleaseState, r.id)
+                                        if row is None:
+                                            row = UserReleaseState(release_id=r.id, rating=int(ov_new))
+                                            s12.add(row)
+                                        else:
+                                            row.rating = int(ov_new)
+                                        s12.commit()
+
+                        with tab_tracks:
+                            for t in tracks:
+                                track_card(t, artist.id)
+
+            # bonus releases: show albums they feature on, not whole album list above
+            st.markdown("#### bonus releases (features on other albums)")
+            with db() as sF:
+                appears_album_ids = [
+                    rid for (rid,) in sF.query(ArtistRelease.release_id)
+                    .filter(ArtistRelease.artist_id == artist.id, ArtistRelease.role == "appears_on")
+                    .all()
+                ]
+                if not appears_album_ids:
+                    st.caption("_no features found yet_")
+                else:
+                    for rid in appears_album_ids:
+                        album = sF.get(Release, rid)
+                        album_tracks = (
+                            sF.query(Track)
+                            .filter(Track.release_id == rid)
+                            .all()
+                        )
+                        feat_tracks = [
+                            t for t in album_tracks
+                            if artist.id in ((t.artist_ids_csv or "").split(",") if t.artist_ids_csv else [])
+                        ]
+                        if not feat_tracks:
+                            continue
+                        cols = st.columns([1, 11])
+                        with cols[0]:
+                            if album.cover:
+                                st.image(album.cover, width=56)
+                        with cols[1]:
+                            tab_overview, tab_tracks = st.tabs(["Overview", "Tracks"])
+                            with tab_overview:
+                                year = (album.release_date or "")[:4]
+                                st.write(f"**{album.title}** ({year})  _bonus release_")
+                                st.caption(f"features {len(feat_tracks)} track(s)")
+                            with tab_tracks:
+                                for t in sorted(feat_tracks, key=lambda x: (x.disc_number or 1, x.track_number or 1)):
+                                    track_card(t, artist.id)

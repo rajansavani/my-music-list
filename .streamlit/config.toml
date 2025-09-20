@@ -1,0 +1,8 @@
+# .streamlit/config.toml
+[theme]
+base="dark"
+primaryColor="#1DB954"            # spotify green
+backgroundColor="#111418"         # dark gray/blue
+secondaryBackgroundColor="#181d27" 
+textColor="#f2f2f2"
+font="sans serif"

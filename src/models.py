@@ -1,6 +1,6 @@
 # all comments in lowercase per your style
 from sqlalchemy import (
-    Column, String, Integer, Boolean, Text, Date, Enum, ForeignKey, UniqueConstraint, Index
+    Column, String, Integer, Boolean, Text, ForeignKey, UniqueConstraint, Index
 )
 from sqlalchemy.orm import relationship
 from .db import Base
@@ -24,7 +24,7 @@ class Release(Base):
     title = Column(String, nullable=False)
     type = Column(String)                          # one of RELEASE_TYPE
     group = Column(String)                         # one of RELEASE_GROUP (spotify album_group)
-    release_date = Column(String)                  # keep raw string (yyyy or yyyy-mm or yyyy-mm-dd)
+    release_date = Column(String)                  # raw string (yyyy or yyyy-mm or yyyy-mm-dd)
     date_precision = Column(String)                # 'year' | 'month' | 'day'
     total_tracks = Column(Integer)
     cover = Column(Text)
@@ -43,7 +43,6 @@ class Release(Base):
     canonical = relationship("Release", remote_side=[id])
 
     __table_args__ = (
-        # avoid exact duplicates per source
         UniqueConstraint("id", "source", name="uq_release_id_source"),
         Index("ix_release_title", "title"),
     )
@@ -66,15 +65,25 @@ class Track(Base):
     track_number = Column(Integer, default=1)
     duration_ms = Column(Integer)
     explicit = Column(Boolean, default=False)
-    isrc = Column(String)                          # key for cross-release dedupe of the same recording
+    isrc = Column(String)                          # key for cross-release dedupe when available
+
+    # store artists on the track so we can detect features
+    artist_ids_csv = Column(Text)                  # e.g., "id1,id2"
+    artist_names_csv = Column(Text)                # e.g., "name1,name2"
+
+    # duplicate detection heuristic (fallback when no isrc):
+    # normalized title + duration (sec bucket) + sorted artist ids
+    canonical_key = Column(String, index=True)
+    primary_artist_id = Column(String, index=True) # first artist id on the track if present
 
     release = relationship("Release", back_populates="tracks")
 
     __table_args__ = (
         Index("ix_track_isrc", "isrc"),
+        Index("ix_track_canon", "canonical_key"),
     )
 
-# user state at release-level (simple and fast)
+# user state at release-level
 class UserReleaseState(Base):
     __tablename__ = "user_release_state"
     release_id = Column(String, ForeignKey("releases.id"), primary_key=True)
@@ -84,11 +93,9 @@ class UserReleaseState(Base):
 
     release = relationship("Release")
 
-# optional: user state at track-level (add later if you want per-track completion)
+# user state at track-level
 class UserTrackState(Base):
     __tablename__ = "user_track_state"
     track_id = Column(String, ForeignKey("tracks.id"), primary_key=True)
     listened = Column(Boolean, default=False)
     rating = Column(Integer)
-
-    # no relationship needed now; add if you plan to query joins a lot
